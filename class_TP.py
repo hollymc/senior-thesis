@@ -6,7 +6,7 @@ import numpy as np
 import datetime
 from datetime import timedelta
 import scipy.sparse as spa
-import cvxpy as cp
+import cvxpy as cvx
 from math import radians, cos, sin, asin, sqrt
 
 class TP:
@@ -75,6 +75,8 @@ class TP:
         self.arcs = arcs
         self.num_arcs = len(arcs)
         
+    # Set-Up Functions for Optimization Problems
+        
     def flow_vars(self):
         A_in = spa.dok_matrix((self.num_nodes, self.num_arcs))
         A_out = spa.dok_matrix((self.num_nodes, self.num_arcs))
@@ -82,9 +84,9 @@ class TP:
         for a in range(self.num_arcs):
             i = self.arcs[a][0]
             j = self.arcs[a][1]
-            A_in[i, a] = 1
-            A_out[j, a] = 1
-            p[a] = self.profits[i, j]
+            A_in[i,a] = 1
+            A_out[j,a] = 1
+            p[a] = self.profits[i,j]
         A_net = A_in - A_out
         
         e = np.zeros(self.num_nodes)
@@ -93,20 +95,21 @@ class TP:
         
         return A_net, A_in, e, p
     
-    def time_vars(self, time_window):
+    def time_vars(self, time_window=.01):
         B = spa.dok_matrix((self.num_arcs, self.num_arcs))
         d = np.zeros(self.num_arcs)
         t_min, t_max = self.time_cons(time_window)
         for a in range(self.num_arcs):
             i = self.arcs[a][0]
             j = self.arcs[a][1]
-            B[a, a] = t_max[i] - t_min[j] + self.T(i, j)
+            B[a,a] = t_max[i] - t_min[j] + self.T(i,j)
             d[a] = t_max[i] - t_min[j]
         return B, d
     
-    def time_cons(self, time_window):
+    def time_cons(self, time_window=.01):
         t_min = []
         t_max = []
+        time_window = timedelta(minutes=time_window)
         for i in range(self.n):
             t_min.append(self.to_minutes(self.data.loc[i, 'pickup_datetime'] - self.midnight))
             t_max.append(self.to_minutes(self.data.loc[i, 'pickup_datetime'] - self.midnight + time_window))
@@ -131,27 +134,62 @@ class TP:
             output = self.data.loc[i, 'dropoff_datetime'] - self.data.loc[i, 'pickup_datetime'] + time_between
         return self.to_minutes(output)
     
-    def problem(self, time_window):
+    # Problem with Time Windows
+    
+    def problem(self, time_window=.01):
         A, A_in, e, p = self.flow_vars()
         B, d = self.time_vars(time_window)
         C = np.transpose(A[:self.n,])
 
-        # Maximum Flow Problem CVXPY
-        x = cp.Variable(self.num_arcs, boolean = True)
-        t = cp.Variable(self.n)
+        x = cvx.Variable(self.num_arcs, boolean = True)
+        t = cvx.Variable(self.n)
         ## Network Flow Constraints
-        constraints = [A @ x == e]
         inflow = A_in @ x
-        constraints += [inflow[:self.source] <= 1]
+        constraints = [A @ x == e, inflow[:self.source] <= 1]
         ## Time Window Constraints
         t_min, t_max = self.time_cons(time_window)
         constraints += [t_min[:self.n] <= t, t <= t_max[:self.n]]
         constraints += [B @ x + C @ t <= d]
 
         profit = np.transpose(p) @ x
-        objective = cp.Maximize(profit)
-        problem = cp.Problem(objective, constraints)
+        objective = cvx.Maximize(profit)
+        problem = cvx.Problem(objective, constraints)
         return x, problem
+    
+    # Problem with Times as Parameters
+    
+    def time_params(self, t, time_window=.01):
+        B = cvx.Variable((self.num_arcs, self.num_arcs))
+        d = cvx.Variable(self.num_arcs)
+        time_cons = []
+        t_min = t
+        t_max = t + time_window
+        for a in range(self.num_arcs):
+            i = self.arcs[a][0]
+            j = self.arcs[a][1]
+            time_cons += [B[a,a] == t_max[i] - t_min[j] + self.T(i,j)]
+            time_cons += [d[a] == t_max[i] - t_min[j]]
+        return B, d, time_cons
+    
+    def problem_param(self, time_window=.01):
+        x = cvx.Variable(self.num_arcs)
+        t = cvx.Parameter(self.num_nodes)
+        
+        A, A_in, e, p = self.flow_vars()
+        B, d, time_cons = self.time_params(t, time_window)
+        C = np.transpose(A[:self.n,])
+        
+        ## Network Flow Constraints
+        inflow = A_in @ x
+        constraints = [A @ x == e, inflow[:self.source] <= 1]
+        ## Time Window Constraints
+        constraints += time_cons
+        constraints += [B @ x + C @ t[:self.n] <= d]
+        
+        profit = np.transpose(p) @ x
+        objective = cvx.Maximize(profit)
+        problem = cvx.Problem(objective, constraints)
+        return t, x, problem
     
     # Helper Functions
     
