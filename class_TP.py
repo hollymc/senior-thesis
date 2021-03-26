@@ -6,22 +6,23 @@ import numpy as np
 import datetime
 from datetime import timedelta
 import scipy.sparse as spa
-import cvxpy as cvx
+import cvxpy as cp
 from math import radians, cos, sin, asin, sqrt
 
 class TP:
     
-    def __init__(self, data, taxis=3, taxi_lon=-73.9772, taxi_lat=40.7527, mph=20, driving_cost=.6, taxi_cost=0, flex=timedelta(minutes=20)):
+    def __init__(self, data, taxis=2, taxi_lon=-73.9772, taxi_lat=40.7527, mph=20, driving_cost=.6, taxi_cost=0, flex=20):
         
         n = len(data.index)
-        source = n+taxis
-        sink = n+taxis+1
-        num_nodes = n+taxis+2
+        source = n
+        sink = n+1
+        num_nodes = n+2
         
         year = data.loc[0, 'pickup_datetime'].year
         month = data.loc[0, 'pickup_datetime'].month
         day = data.loc[0, 'pickup_datetime'].day
         midnight = datetime.datetime(year, month, day, 0, 0)
+        flex = timedelta(minutes=flex)
         
         possible = np.zeros((num_nodes, num_nodes))  # =1 if connection (i,j) is possible, =0 if impossible
         profits = np.zeros((num_nodes, num_nodes))   # Net profit from accepting passenger j (based on preceding passenger i)
@@ -40,15 +41,12 @@ class TP:
                 else: possible[i,j] = 1
                 profits[i,j] = data.loc[j, 'total_amount'] - driving_cost * (dist_between + data.loc[j, 'trip_distance'])
 
-        for k in range(n, n+taxis):
-            possible[source, k] = 1
-            profits[source, k] = -taxi_cost
-            for j in range(n):
+                # Taxis (Source to First Customers)
                 dist_between = self.haversine(taxi_lon, taxi_lat, data.loc[j, 'pickup_longitude'], data.loc[j, 'pickup_latitude'])
                 time_between = timedelta(hours = dist_between / mph)
                 if (midnight + time_between > data.loc[j, 'pickup_datetime'] + flex): continue
-                else: possible[k,j] = 1
-                profits[k,j] = data.loc[j, 'total_amount'] - driving_cost * (dist_between + data.loc[j, 'trip_distance'])
+                else: possible[source,j] = 1
+                profits[source,j] = data.loc[j, 'total_amount'] - driving_cost * (dist_between + data.loc[j, 'trip_distance']) - taxi_cost
         
         arcs = {}
         a = 0
@@ -63,10 +61,10 @@ class TP:
         
         self.data = data
         self.n = n
-        self.num_taxis = taxis
         self.source = source
         self.sink = sink
         self.num_nodes = num_nodes
+        self.num_taxis = taxis
         self.taxi_lon = taxi_lon
         self.taxi_lat = taxi_lat
         self.mph = mph
@@ -87,15 +85,14 @@ class TP:
             A_in[i,a] = 1
             A_out[j,a] = 1
             p[a] = self.profits[i,j]
-        A_net = A_in - A_out
         
         e = np.zeros(self.num_nodes)
         e[self.source] = self.num_taxis
         e[self.sink] = -self.num_taxis
         
-        return A_net, A_in, e, p
+        return A_in, A_out, e, p
     
-    def time_vars(self, time_window=.01):
+    def time_vars(self, time_window):
         B = spa.dok_matrix((self.num_arcs, self.num_arcs))
         d = np.zeros(self.num_arcs)
         t_min, t_max = self.time_cons(time_window)
@@ -106,7 +103,7 @@ class TP:
             d[a] = t_max[i] - t_min[j]
         return B, d
     
-    def time_cons(self, time_window=.01):
+    def time_cons(self, time_window):
         t_min = []
         t_max = []
         time_window = timedelta(minutes=time_window)
@@ -116,8 +113,11 @@ class TP:
         for k in range(self.n, self.num_nodes):
             t_min.append(0)
             t_max.append(0)
+#         hours_24 = timedelta(hours=24)
+#         t_min.append(self.to_minutes(self.midnight + hours_24))
+#         t_max.append(self.to_minutes(self.midnight + hours_24))
         return t_min, t_max
-                         
+        
     def T(self, i, j):
         if (i == j or i == self.source): return 0
         # From customer to sink
@@ -136,59 +136,70 @@ class TP:
     
     # Problem with Time Windows
     
-    def problem(self, time_window=.01):
-        A, A_in, e, p = self.flow_vars()
+    def problem_window(self, time_window=0):
+        # Variables
+        x = cp.Variable(self.num_arcs, boolean=True)
+        f = cp.Variable(self.n)
+        t = cp.Variable(self.n)
+        
+        A_in, A_out, e, p = self.flow_vars()
+        A = A_in - A_out
         B, d = self.time_vars(time_window)
         C = np.transpose(A[:self.n,])
-
-        x = cvx.Variable(self.num_arcs, boolean = True)
-        t = cvx.Variable(self.n)
+        
         ## Network Flow Constraints
+        constraints = [A @ x <= e, f >= 0, f <= 1]
         inflow = A_in @ x
-        constraints = [A @ x == e, inflow[:self.source] <= 1]
+        outflow = A_out @ x
+        constraints += [inflow[:self.n] == f, outflow[:self.n] == f]
+
         ## Time Window Constraints
         t_min, t_max = self.time_cons(time_window)
         constraints += [t_min[:self.n] <= t, t <= t_max[:self.n]]
         constraints += [B @ x + C @ t <= d]
 
         profit = np.transpose(p) @ x
-        objective = cvx.Maximize(profit)
-        problem = cvx.Problem(objective, constraints)
+        objective = cp.Minimize(-profit)
+        problem = cp.Problem(objective, constraints)
         return x, problem
     
     # Problem with Times as Parameters
     
-    def time_params(self, t, time_window=.01):
-        B = cvx.Variable((self.num_arcs, self.num_arcs))
-        d = cvx.Variable(self.num_arcs)
+    def time_params(self, t, time_window):
+        b = []
+        d = []
+#         d = cp.Variable(self.num_arcs)
         time_cons = []
         t_min = t
         t_max = t + time_window
         for a in range(self.num_arcs):
             i = self.arcs[a][0]
             j = self.arcs[a][1]
-            time_cons += [B[a,a] == t_max[i] - t_min[j] + self.T(i,j)]
-            time_cons += [d[a] == t_max[i] - t_min[j]]
-        return B, d, time_cons
+            b.append(t_max[i] - t_min[j] + self.T(i,j))
+            d.append(t_max[i] - t_min[j])
+#             time_cons += [d[a] == t_max[i] - t_min[j]]
+        return cp.hstack(b), cp.hstack(d), time_cons
     
-    def problem_param(self, time_window=.01):
-        x = cvx.Variable(self.num_arcs)
-        t = cvx.Parameter(self.num_nodes)
-        
-        A, A_in, e, p = self.flow_vars()
-        B, d, time_cons = self.time_params(t, time_window)
+    def problem_param(self, time_window=0):
+        # Variables and Parameter
+        x = cp.Variable(self.num_arcs)
+        f = cp.Variable(self.n)
+        t = cp.Parameter(self.num_nodes)
+
+        A_in, A_out, e, p = self.flow_vars()
+        A = A_in - A_out
+        b, d, constraints = self.time_params(t, time_window)
         C = np.transpose(A[:self.n,])
         
-        ## Network Flow Constraints
+        constraints += [A @ x <= e, x >= 0, x <= 1, f >= 0, f <= 1]
         inflow = A_in @ x
-        constraints = [A @ x == e, inflow[:self.source] <= 1]
-        ## Time Window Constraints
-        constraints += time_cons
-        constraints += [B @ x + C @ t[:self.n] <= d]
+        outflow = A_out @ x
+        constraints += [inflow[:self.n] == f, outflow[:self.n] == f]
+        constraints += [cp.multiply(b,x) + C @ t[:self.n] <= d]
         
         profit = np.transpose(p) @ x
-        objective = cvx.Maximize(profit)
-        problem = cvx.Problem(objective, constraints)
+        objective = cp.Minimize(-profit)
+        problem = cp.Problem(objective, constraints)
         return t, x, problem
     
     # Helper Functions
