@@ -11,7 +11,7 @@ from math import radians, cos, sin, asin, sqrt
 
 class TP:
     
-    def __init__(self, data, taxis=2, taxi_lon=-73.9772, taxi_lat=40.7527, mph=20, driving_cost=.6, taxi_cost=0, flex=20):
+    def __init__(self, data, taxis=3, taxi_lon=-73.9772, taxi_lat=40.7527, mph=20, driving_cost=.6, taxi_cost=0, flex=20):
         
         n = len(data.index)
         source = n
